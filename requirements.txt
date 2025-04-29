@@ -1,6 +1,6 @@
 flask
 openai
-python-dateparser
+dateparser
 pytz
 apscheduler
 twilio
