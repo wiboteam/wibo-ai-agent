@@ -1,16 +1,14 @@
 import os
 import json
-from datetime import datetime, timedelta
-
-import pytz
 import dateparser
+import pytz
+from datetime import datetime, timedelta
 from flask import Flask, request
-from apscheduler.schedulers.background import BackgroundScheduler
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client as TwilioClient
+from apscheduler.schedulers.background import BackgroundScheduler
 from openai import OpenAI
 
-# === CONFIG DA VARIABILI D’AMBIENTE ===
+# === CONFIG DA ENV VARS ===
 OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID     = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN      = os.getenv("TWILIO_AUTH_TOKEN")
@@ -21,13 +19,15 @@ if not OPENAI_API_KEY:
 if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER]):
     raise RuntimeError("Devi impostare TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN e TWILIO_WHATSAPP_NUMBER")
 
+# client OpenAI
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Flask app e timezone
 app = Flask(__name__)
 tz = pytz.timezone("Europe/Rome")
 memory_file = "memory.json"
 
-# === MEMORIA ===
+# === MEMORY ===
 def load_memory():
     if os.path.exists(memory_file):
         with open(memory_file, "r", encoding="utf-8") as f:
@@ -40,29 +40,27 @@ def save_memory(mem):
 
 memory = load_memory()
 
-# === ESTRAZIONE EVENTI ===
-def estrai_evento(text: str):
-    # estrai azione+data futura con ChatCompletion
-    prompt = f"""
-L'utente ha scritto: "{text}"
-Estrai l'azione pianificata e la data/ora in ISO-8601 (incluso timezone Europe/Rome). 
-Se non c'è intenzione futura, restituisci {{ "azione": null, "data": null }}.
-
-Rispondi solo con JSON:
-{{"azione":"...","data":"YYYY-MM-DDTHH:MM:SS+02:00"}}
-"""
-    resp = openai_client.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role":"user","content":prompt}]
-    )
-    content = resp.choices[0].message.content.strip()
-    try:
-        ev = json.loads(content)
-        if "azione" in ev and "data" in ev:
-            return ev
-    except:
-        pass
-    return {"azione": None, "data": None}
+# === Function Calling Schema ===
+functions = [
+  {
+    "name": "schedule_event",
+    "description": "Registra un evento futuro da ricordare",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "Cosa farà l'utente"
+        },
+        "datetime": {
+          "type": "string",
+          "description": "Data e ora ISO con timezone, es. 2025-05-20T15:00:00+02:00"
+        }
+      },
+      "required": ["action", "datetime"]
+    }
+  }
+]
 
 # === SCHEDULER ===
 scheduler = BackgroundScheduler()
@@ -70,22 +68,29 @@ scheduler = BackgroundScheduler()
 def check_eventi():
     now = datetime.now(tz)
     updated = False
+
     for user, data in memory.items():
         nuovi = []
         for ev in data.get("events", []):
             dt = datetime.fromisoformat(ev["datetime_evento"]).astimezone(tz)
-            az = ev.get("azione","")
+            az = ev.get("azione", "")
 
-            # reminder un’ora prima
+            # reminder 1h prima
             if not ev.get("sent_before") and now >= dt - timedelta(hours=1):
-                testo = f"Ehi! Alle {dt.strftime('%H:%M')} avevi in programma “{az}” – preparati! 😉"
+                orario = dt.strftime("%H:%M")
+                testo = (
+                    f"Ehi! Alle {orario} avevi in programma “{az}” – "
+                    "è quasi il momento, preparati! 😉"
+                )
+                print(f"[DEBUG] INVIO reminder-before a {user} per evento “{az}” alle {orario}")
                 send_whatsapp(user, testo)
                 ev["sent_before"] = True
                 updated = True
 
-            # follow-up due ore dopo
+            # follow-up 2h dopo
             if not ev.get("sent_after") and now >= dt + timedelta(hours=2):
                 testo2 = f"Com'è andata l'attività “{az}”? Raccontami!"
+                print(f"[DEBUG] INVIO follow-up-after a {user} per evento “{az}”")
                 send_whatsapp(user, testo2)
                 ev["sent_after"] = True
                 updated = True
@@ -101,8 +106,9 @@ def check_eventi():
 scheduler.add_job(check_eventi, "interval", minutes=1)
 scheduler.start()
 
-# === INVIO WHATSAPP REALE ===
+# === SEND REAL WHATSAPP ===
 def send_whatsapp(to: str, body: str):
+    from twilio.rest import Client as TwilioClient
     tw = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     msg = tw.messages.create(
         body=body,
@@ -114,41 +120,49 @@ def send_whatsapp(to: str, body: str):
 # === ENDPOINT FLASK ===
 @app.route("/bot", methods=["POST"])
 def bot():
-    incoming = request.values.get("Body","").strip()
-    sender   = request.values.get("From","").strip()
+    incoming = request.values.get("Body", "").strip()
+    sender   = request.values.get("From", "").strip()
     print(f"Messaggio ricevuto da {sender}: {incoming}")
 
-    memory.setdefault(sender, {"messages":[], "events":[]})
-    memory[sender]["messages"].append({"role":"user","content":incoming})
+    # inizializza la memoria per il nuovo utente
+    memory.setdefault(sender, {"messages": [], "events": []})
+    memory[sender]["messages"].append({"role": "user", "content": incoming})
 
-    ev = estrai_evento(incoming)
-    print("[DEBUG] Evento estratto:", ev)
+    # chiamata GPT con function calling
+    resp = openai_client.chat.completions.create(
+        model="gpt-4-0613",
+        messages=memory[sender]["messages"],
+        functions=functions,
+        function_call="auto"
+    )
+    msg = resp.choices[0].message
 
-    if ev["azione"] and ev["data"]:
+    # se GPT chiama la nostra funzione schedule_event
+    if msg.get("function_call"):
+        payload = json.loads(msg.function_call.arguments)
+        action = payload["action"]
+        dt_iso = payload["datetime"]
+
+        # salva l'evento in memoria
+        ev = {"azione": action, "datetime_evento": dt_iso}
+        memory[sender]["events"].append(ev)
+        save_memory(memory)
+
+        # rispondi all’utente con conferma
         dt = dateparser.parse(
-            ev["data"],
+            dt_iso,
             settings={
-                "TIMEZONE":"Europe/Rome",
-                "RETURN_AS_TIMEZONE_AWARE":True,
-                "PREFER_DATES_FROM":"future"
+                "TIMEZONE": "Europe/Rome",
+                "RETURN_AS_TIMEZONE_AWARE": True
             }
         )
-        if dt:
-            ev["datetime_evento"] = dt.isoformat()
-            memory[sender]["events"].append(ev)
-            save_memory(memory)
-            human_date = dt.strftime("%d/%m alle %H:%M")
-            reply = f"Perfetto, ho registrato “{ev['azione']}” per il {human_date}. Ci sentiamo poco prima per un ripasso 🙂"
-        else:
-            reply = "Ho capito l'azione, ma non la data. Puoi riscriverla?"
+        human_date = dt.strftime("%d/%m alle %H:%M")
+        reply = f"Perfetto, ho registrato “{action}” per il {human_date}. Ci sentiamo poco prima per un ripasso 🙂"
+
     else:
-        history = memory[sender]["messages"][-10:]
-        resp = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=history
-        )
-        reply = resp.choices[0].message.content.strip()
-        memory[sender]["messages"].append({"role":"assistant","content":reply})
+        # normale chat reply
+        reply = msg.content.strip()
+        memory[sender]["messages"].append({"role": "assistant", "content": reply})
         save_memory(memory)
 
     twresp = MessagingResponse()
@@ -156,5 +170,6 @@ def bot():
     return str(twresp)
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
