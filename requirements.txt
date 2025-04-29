@@ -1,5 +1,7 @@
 flask
-openai
 twilio
-schedule
+openai
+apscheduler
+dateparser
 pytz
+python-dotenv
