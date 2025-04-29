@@ -94,7 +94,7 @@ def check_eventi():
             az = ev["azione"]
 
             if not ev.get("sent_before") and now >= dt - timedelta(hours=1):
-                send_whatsapp(user, f"Ehi! Alle {dt.strftime('%H:%M')} avevi in programma “{az}” – preparati! 😉")
+                send_whatsapp(user, f"Ehi! Alle {dt.strftime('%H:%M')} hai in programma “{az}” – preparati! 😉")
                 ev["sent_before"]=True
 
             if not ev.get("sent_after") and now >= dt + timedelta(hours=2):
